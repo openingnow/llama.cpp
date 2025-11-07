@@ -532,11 +532,12 @@ struct oaicompat_parser_options {
     bool enable_thinking = true;
 };
 
-// used by /chat/completions endpoint
+// used by /chat/completions and /responses endpoint
 static json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const oaicompat_parser_options & opt,
-    std::vector<raw_buffer> & out_files)
+    std::vector<raw_buffer> & out_files,
+    const bool is_response)
 {
     json llama_params;
 
@@ -582,12 +583,15 @@ static json oaicompat_chat_params_parse(
     }
 
     // get input files
-    if (!body.contains("messages")) {
-        throw std::runtime_error("'messages' is required");
+    const std::string input_key = is_response ? "input" : "messages";
+    if (!body.contains(input_key)) {
+        throw std::runtime_error("'" + input_key + "' is required");
     }
-    json & messages = body.at("messages");
+    json & messages = body.at(input_key);
     if (!messages.is_array()) {
-        throw std::runtime_error("Expected 'messages' to be an array");
+        // TODO-/v1/responses add instructions as developer role
+        // TODO-/v1/responses input allows single text
+        throw std::runtime_error("Expected '" + input_key + "' to be an array");
     }
     for (auto & msg : messages) {
         std::string role = json_value(msg, "role", std::string());

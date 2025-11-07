@@ -74,6 +74,7 @@ enum oaicompat_type {
     OAICOMPAT_TYPE_CHAT,
     OAICOMPAT_TYPE_COMPLETION,
     OAICOMPAT_TYPE_EMBEDDING,
+    OAICOMPAT_TYPE_RESPONSE,
 };
 
 // https://community.openai.com/t/openai-chat-list-of-error-codes-and-types/357791/11
@@ -820,6 +821,8 @@ struct server_task_result_cmpl_final : server_task_result {
                 return to_json_oaicompat();
             case OAICOMPAT_TYPE_CHAT:
                 return stream ? to_json_oaicompat_chat_stream() : to_json_oaicompat_chat();
+            case OAICOMPAT_TYPE_RESPONSE:
+                return stream ? to_json_oaicompat_response_stream() : to_json_oaicompat_response();
             default:
                 GGML_ASSERT(false && "Invalid oaicompat_type");
         }
@@ -1015,6 +1018,123 @@ struct server_task_result_cmpl_final : server_task_result {
 
         return deltas;
     }
+
+    json to_json_oaicompat_response() {
+        std::string finish_reason = "length";
+        common_chat_msg msg;
+        if (!oaicompat_msg.empty()) {
+            msg = oaicompat_msg;
+        } else {
+            msg.role = "assistant";
+            msg.content = content;
+        }
+        if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
+            finish_reason = msg.tool_calls.empty() ? "stop" : "tool_calls";
+        }
+
+        json output_text {
+            {"type", "output_text"},
+            {"logprobs", json::array({})},
+            {"text", msg.to_json_oaicompat<json>()["content"]},
+        };
+
+        json output {
+            {"id", oaicompat_cmpl_id}, // TODO-/v1/responses `"msg_" + random_string()`
+            {"type", "message"},
+            {"content", json::array({output_text})},
+            {"role", msg.to_json_oaicompat<json>()["role"]},
+        };
+
+        // TODO-/v1/responses handle "include": ["message.output_text.logprobs"]
+        // if (!stream && probs_output.size() > 0) {
+        //     choice["logprobs"] = json{
+        //         {"content", completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs)},
+        //     };
+        // }
+
+        std::time_t t = std::time(0);
+
+        json res {
+            {"id",         "resp_" + random_string()},
+            {"object",     "response"},
+            {"created_at", t},
+            {"model",      oaicompat_model},
+            {"output",     json::array({output})}, // TODO-/v1/responses add reasoning output
+            {"usage", json {
+                {"input_tokens",  n_prompt_tokens},
+                {"output_tokens", n_decoded},
+                {"total_tokens",  n_decoded + n_prompt_tokens}
+            }},
+        };
+
+        // extra fields for debugging purposes
+        if (verbose) {
+            res["__verbose"] = to_json_non_oaicompat();
+        }
+        if (timings.prompt_n >= 0) {
+            res.push_back({"timings", timings.to_json()});
+        }
+
+        return res;
+    }
+
+    json to_json_oaicompat_response_stream() {
+        std::time_t t = std::time(0);
+        std::string finish_reason = "length";
+        if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
+            finish_reason = oaicompat_msg.tool_calls.empty() ? "stop" : "tool_calls";
+        }
+
+        json deltas = json::array();
+        for (const auto & diff : oaicompat_msg_diffs) {
+            deltas.push_back({
+                {"type", "response.output_text.delta(final)"}, // TODO-/v1/responses remove (final)
+                {"delta", common_chat_msg_diff_to_json_oaicompat<json>(diff)["content"]},
+                {"created", t},
+                {"item_id", oaicompat_cmpl_id}, // TODO-/v1/responses `"msg_" + random_string()`
+                {"model", oaicompat_model},
+                {"system_fingerprint", build_info},
+            });
+        }
+
+        deltas.push_back({
+            {"type", "response.output_text.delta(final_last)"}, // TODO-/v1/responses remove (final_last)
+            {"delta", ""},
+            {"created", t},
+            {"item_id", oaicompat_cmpl_id}, // TODO-/v1/responses `"msg_" + random_string()`
+            {"model", oaicompat_model},
+            {"system_fingerprint", build_info},
+        });
+
+        if (include_usage) {
+            // OpenAI API spec for chat.completion.chunks specifies an empty `choices` array for the last chunk when including usage
+            // https://platform.openai.com/docs/api-reference/chat_streaming/streaming#chat_streaming/streaming-choices
+            deltas.push_back({
+                {"choices", json::array()},
+                {"created",            t},
+                {"id",                 oaicompat_cmpl_id},
+                {"model",              oaicompat_model},
+                {"system_fingerprint", build_info},
+                {"object",             "chat.completion.chunk"},
+                {"usage", json {
+                    {"completion_tokens", n_decoded},
+                    {"prompt_tokens",     n_prompt_tokens},
+                    {"total_tokens",      n_decoded + n_prompt_tokens},
+                }},
+            });
+        }
+
+        if (timings.prompt_n >= 0) {
+            deltas.back().push_back({"timings", timings.to_json()});
+        }
+
+        // extra fields for debugging purposes
+        if (verbose && !deltas.empty()) {
+            deltas.front()["__verbose"] = to_json_non_oaicompat();
+        }
+
+        return deltas;
+    }
 };
 
 struct server_task_result_cmpl_partial : server_task_result {
@@ -1055,6 +1175,8 @@ struct server_task_result_cmpl_partial : server_task_result {
                 return to_json_oaicompat();
             case OAICOMPAT_TYPE_CHAT:
                 return to_json_oaicompat_chat();
+            case OAICOMPAT_TYPE_RESPONSE:
+                return to_json_oaicompat_response();
             default:
                 GGML_ASSERT(false && "Invalid oaicompat_type");
         }
@@ -1159,6 +1281,55 @@ struct server_task_result_cmpl_partial : server_task_result {
         if (!deltas.empty()) {
             auto & last_json = deltas[deltas.size() - 1];
             GGML_ASSERT(last_json.at("choices").size() >= 1);
+
+            if (prob_output.probs.size() > 0) {
+                last_json.at("choices").at(0)["logprobs"] = json {
+                    {"content", completion_token_output::probs_vector_to_json({prob_output}, post_sampling_probs)},
+                };
+            }
+
+            if (timings.prompt_n >= 0) {
+                last_json.push_back({"timings", timings.to_json()});
+            }
+            if (is_progress) {
+                last_json.push_back({"prompt_progress", progress.to_json()});
+            }
+        }
+
+        return deltas;
+    }
+
+    json to_json_oaicompat_response() {
+        bool first = n_decoded == 1;
+        std::time_t t = std::time(0);
+        json choices;
+
+        std::vector<json> deltas;
+        auto add_delta = [&](const json & delta) {
+            deltas.push_back({
+                {"type", "response.output_text.delta(partial)"}, // TODO-/v1/responses remove (partial)
+                {"delta", delta["content"]},
+                {"created", t},
+                {"item_id", oaicompat_cmpl_id}, // TODO-/v1/responses `"msg_" + random_string()`
+                {"model", oaicompat_model},
+                {"system_fingerprint", build_info},
+            });
+        };
+        // We have to send an initial update to conform to openai behavior
+        if (first || is_progress) {
+            add_delta({
+                {"role", "assistant"},
+                {"content", nullptr},
+            });
+        }
+
+        for (const auto & diff : oaicompat_msg_diffs) {
+            add_delta(common_chat_msg_diff_to_json_oaicompat<json>(diff));
+        }
+
+        if (!deltas.empty()) {
+            auto & last_json = deltas[deltas.size() - 1];
+            // GGML_ASSERT(last_json.at("choices").size() >= 1);
 
             if (prob_output.probs.size() > 0) {
                 last_json.at("choices").at(0)["logprobs"] = json {
@@ -5215,23 +5386,26 @@ int main(int argc, char ** argv) {
             OAICOMPAT_TYPE_NONE); // infill is not OAI compatible
     };
 
-    const auto handle_chat_completions = [&ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
-        LOG_DBG("request: %s\n", req.body.c_str());
+    const auto handle_chat_completions = [&ctx_server, &handle_completions_impl](const bool is_response) {
+        return [is_response, &ctx_server, &handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
+            LOG_DBG("request: %s\n", req.body.c_str());
 
-        auto body = json::parse(req.body);
-        std::vector<raw_buffer> files;
-        json data = oaicompat_chat_params_parse(
-            body,
-            ctx_server.oai_parser_opt,
-            files);
+            auto body = json::parse(req.body);
+            std::vector<raw_buffer> files;
+            json data = oaicompat_chat_params_parse(
+                body,
+                ctx_server.oai_parser_opt,
+                files,
+                is_response);
 
-        handle_completions_impl(
-            SERVER_TASK_TYPE_COMPLETION,
-            data,
-            files,
-            req.is_connection_closed,
-            res,
-            OAICOMPAT_TYPE_CHAT);
+            handle_completions_impl(
+                SERVER_TASK_TYPE_COMPLETION,
+                data,
+                files,
+                req.is_connection_closed,
+                res,
+                is_response ? OAICOMPAT_TYPE_RESPONSE : OAICOMPAT_TYPE_CHAT);
+        };
     };
 
     // same with handle_chat_completions, but without inference part
@@ -5241,7 +5415,8 @@ int main(int argc, char ** argv) {
         json data = oaicompat_chat_params_parse(
             body,
             ctx_server.oai_parser_opt,
-            files);
+            files,
+            false);
         res_ok(res, {{ "prompt", std::move(data.at("prompt")) }});
     };
 
@@ -5638,9 +5813,10 @@ int main(int argc, char ** argv) {
     svr->Post(params.api_prefix + "/completion",          handle_completions); // legacy
     svr->Post(params.api_prefix + "/completions",         handle_completions);
     svr->Post(params.api_prefix + "/v1/completions",      handle_completions_oai);
-    svr->Post(params.api_prefix + "/chat/completions",    handle_chat_completions);
-    svr->Post(params.api_prefix + "/v1/chat/completions", handle_chat_completions);
-    svr->Post(params.api_prefix + "/api/chat",            handle_chat_completions); // ollama specific endpoint
+    svr->Post(params.api_prefix + "/chat/completions",    handle_chat_completions(false));
+    svr->Post(params.api_prefix + "/v1/chat/completions", handle_chat_completions(false));
+    svr->Post(params.api_prefix + "/api/chat",            handle_chat_completions(false)); // ollama specific endpoint
+    svr->Post(params.api_prefix + "/v1/responses",        handle_chat_completions(true));
     svr->Post(params.api_prefix + "/infill",              handle_infill);
     svr->Post(params.api_prefix + "/embedding",           handle_embeddings); // legacy
     svr->Post(params.api_prefix + "/embeddings",          handle_embeddings);
